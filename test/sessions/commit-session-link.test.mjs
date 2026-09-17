@@ -183,6 +183,26 @@ test("collectCommitFacts parses numstat, subject, and session trailers (AC-1, AC
   assert.deepEqual(windowed.commits.map((commit) => commit.subject), ["fix: bump app value"]);
 });
 
+test("cli correlate keeps a collected Codex session heuristic when its trailer names Claude (AC-5)", async (t) => {
+  const root = await createFixtureRepo();
+  const home = await mkdtemp(path.join(os.tmpdir(), "commit-session-link-codex-home-"));
+  t.onTestFinished(() => Promise.all([rm(root, { recursive: true, force: true }), rm(home, { recursive: true, force: true })]));
+  await mkdir(path.join(home, ".codex", "sessions", "2026", "08", "02"), { recursive: true });
+  await writeFile(path.join(home, ".codex", "sessions", "2026", "08", "02", "rollout-2026-08-02T03-20-00-shared-session-id.jsonl"), `${JSON.stringify({ timestamp: "2026-08-02T03:20:00.000Z", type: "session_meta", payload: { id: "shared-session-id", cwd: root } })}\n`);
+  await writeFile(path.join(root, "src", "app.mjs"), "export const app = 3;\n");
+  git(root, ["add", "."]);
+  git(root, ["commit", "-m", "fix: retain host identity\n\nHarness-Session: claude/shared-session-id"], { GIT_AUTHOR_DATE: "2026-08-02T11:30:00+08:00", GIT_COMMITTER_DATE: "2026-08-02T11:30:00+08:00" });
+  const result = spawnSync(process.execPath, [CLI_PATH, "correlate", "--workspace", root, "--platform", "codex", "--commits", "5"], { encoding: "utf8", env: { ...process.env, HOME: home, USERPROFILE: home } });
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.sessionCount, 1);
+  const [match] = payload.commits[0].matches;
+  assert.equal(match.sessionId, "shared-session-id");
+  assert.equal(match.platform, "codex");
+  assert.equal(match.confidence, "medium");
+  assert.equal(match.evidence.linkType, null);
+});
+
 test("collectCommitFacts rejects unknown commits", async (t) => {
   const root = await createFixtureRepo();
   t.onTestFinished(() => rm(root, { recursive: true, force: true }));
@@ -394,6 +414,49 @@ test("correlation ranks explicit > high > medium > low and drops non-overlapping
   );
   assert.equal(matches[0].evidence.trailer, "qoder/explicit-session");
   assert.deepEqual(matches[1].evidence.overlappingFiles, ["src/app.mjs"]);
+});
+
+test("qualified Harness-Session links require exactly one matching host segment (AC-1, AC-2, AC-3)", () => {
+  const commit = {
+    hash: "d".repeat(40),
+    shortHash: "ddddddd",
+    subject: "fix: preserve host identity",
+    authoredAt: "2026-08-02T11:30:00+08:00",
+    files: [],
+    sessionTrailers: [],
+  };
+  const noEvidence = { firstSeen: null, lastSeen: null, files: [], cwdWithinRepo: false };
+  const cases = [
+    { name: "keeps a bare legacy id", trailer: "shared-id", platform: null, sessionId: "shared-id", confidence: "explicit" },
+    { name: "accepts the matching host", trailer: "claude/shared-id", platform: "claude", sessionId: "shared-id", confidence: "explicit" },
+    { name: "rejects a different host", trailer: "claude/shared-id", platform: "codex", sessionId: "shared-id", confidence: null },
+    { name: "rejects a missing host", trailer: "claude/shared-id", platform: null, sessionId: "shared-id", confidence: null },
+    { name: "does not expand an alias", trailer: "claude-code/shared-id", platform: "claude", sessionId: "shared-id", confidence: null },
+    { name: "rejects an unknown host", trailer: "unknown/shared-id", platform: "claude", sessionId: "shared-id", confidence: null },
+    { name: "rejects nested prefixes", trailer: "claude/nested/shared-id", platform: "claude", sessionId: "shared-id", confidence: null },
+    { name: "rejects slash-bearing session ids", trailer: "claude/shared/id", platform: "claude", sessionId: "shared/id", confidence: null },
+  ];
+
+  for (const item of cases) {
+    const match = correlateCommitSession(
+      { ...commit, sessionTrailers: [item.trailer] },
+      fixtureSession({ ...noEvidence, platform: item.platform, sessionId: item.sessionId }),
+    );
+    assert.equal(match?.confidence ?? null, item.confidence, item.name);
+  }
+
+  const report = correlateCommitsWithSessions(
+    [{ ...commit, sessionTrailers: ["claude/shared-id"] }],
+    [
+      fixtureSession({ ...noEvidence, platform: "claude", sessionId: "shared-id" }),
+      fixtureSession({ ...noEvidence, platform: "codex", sessionId: "shared-id" }),
+    ],
+  );
+  assert.deepEqual(report.commits[0].matches.map((match) => match.platform), ["claude"]);
+  assert.equal(correlateCommitSession(
+    { ...commit, sessionTrailers: ["claude/shared-id"] },
+    fixtureSession({ platform: "codex", sessionId: "shared-id", files: [], cwdWithinRepo: true }),
+  )?.confidence, "medium");
 });
 
 test("grace window boundary controls time overlap (AC-2)", () => {

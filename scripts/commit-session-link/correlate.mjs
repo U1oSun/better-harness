@@ -22,8 +22,13 @@ function linkMatch(commit, session) {
     ? commit.sessionLinks
     : (commit.sessionTrailers ?? []).map((value) => ({ type: "harness-session", value }));
   for (const link of links) {
-    if (link.type === "harness-session"
-      && (link.value === session.sessionId || link.value.endsWith(`/${session.sessionId}`))) {
+    const segments = typeof link.value === "string" ? link.value.split("/") : [];
+    const bareSessionLink = segments.length === 1
+      && segments[0].length > 0 && segments[0] === session.sessionId;
+    const qualifiedSessionLink = segments.length === 2
+      && segments.every((segment) => segment.length > 0)
+      && segments[0] === session.platform && segments[1] === session.sessionId;
+    if (link.type === "harness-session" && (bareSessionLink || qualifiedSessionLink)) {
       return link;
     }
     if (link.type === "entire-checkpoint" && session.checkpointIds?.includes(link.value)) {
